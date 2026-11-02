@@ -1,0 +1,22 @@
+[package]
+name = "ogzi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A CLAP sampler plugin for the Ogzi sample library"
+readme = "README.md"
+repository = "https://github.com/ogzi-music/ogzi"
+license = "MIT"
+keywords = ["audio-plugin", "clap", "flac", "instrument", "sampler"]
+categories = ["multimedia::audio"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+claxon = "0.4"
+egui = { version = "0.37", features = ["default_fonts"] }
+nice-plug = "0.4.2"
+nice-plug-egui = "0.6.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
