@@ -95,16 +95,29 @@ pub(crate) struct LoadedSample {
     pub(crate) loop_start: Option<usize>,
 }
 
+/// A set of samples sharing the same key and velocity ranges. Consecutive hits alternate
+/// between the group's samples (round-robin) to avoid the machine-gun effect of repeating
+/// one recording.
+pub(crate) struct SampleGroup {
+    /// The group's samples, in file order.
+    pub(crate) samples: Vec<Arc<LoadedSample>>,
+    pub(crate) key_from: u8,
+    pub(crate) key_to: u8,
+    pub(crate) vel_from: u8,
+    pub(crate) vel_to: u8,
+}
+
 /// A fully loaded instrument: all of its samples decoded into memory.
 pub(crate) struct LoadedInstrument {
-    pub(crate) samples: Vec<Arc<LoadedSample>>,
+    /// The instrument's alternation groups, in order of first appearance in the metadata.
+    pub(crate) groups: Vec<SampleGroup>,
 }
 
 impl LoadedInstrument {
-    /// Pick the sample covering the given note and velocity.
-    pub(crate) fn pick(&self, note: u8, velocity: u8) -> Option<&Arc<LoadedSample>> {
-        self.samples.iter().find(|s| {
-            note >= s.key_from && note <= s.key_to && velocity >= s.vel_from && velocity <= s.vel_to
+    /// The first group covering the given note and velocity, along with its index.
+    pub(crate) fn covering_group(&self, note: u8, velocity: u8) -> Option<(usize, &SampleGroup)> {
+        self.groups.iter().enumerate().find(|(_, g)| {
+            note >= g.key_from && note <= g.key_to && velocity >= g.vel_from && velocity <= g.vel_to
         })
     }
 }
@@ -134,16 +147,44 @@ pub(crate) fn load_instrument(
     let meta: InstrumentToml =
         toml::from_str(&meta_raw).map_err(|e| format!("{}: {e}", meta_path.display()))?;
 
-    let mut samples = Vec::new();
+    let mut groups: Vec<SampleGroup> = Vec::new();
     for s in meta.samples {
         let path = dir.join(&s.file);
-        match load_sample(&path, s) {
-            Ok(sample) => samples.push(Arc::new(sample)),
-            Err(e) => nice_error!("Ogzi: skipping sample {}: {e}", path.display()),
+        let sample = match load_sample(&path, s) {
+            Ok(sample) => sample,
+            Err(e) => {
+                nice_error!("Ogzi: skipping sample {}: {e}", path.display());
+                continue;
+            }
+        };
+
+        // Samples sharing the same key and velocity ranges form a round-robin alternation
+        // group.
+        let group = groups.iter_mut().find(|g| {
+            g.key_from == sample.key_from
+                && g.key_to == sample.key_to
+                && g.vel_from == sample.vel_from
+                && g.vel_to == sample.vel_to
+        });
+        match group {
+            Some(group) => group.samples.push(Arc::new(sample)),
+            None => {
+                let key_from = sample.key_from;
+                let key_to = sample.key_to;
+                let vel_from = sample.vel_from;
+                let vel_to = sample.vel_to;
+                groups.push(SampleGroup {
+                    samples: vec![Arc::new(sample)],
+                    key_from,
+                    key_to,
+                    vel_from,
+                    vel_to,
+                });
+            }
         }
     }
 
-    Ok(LoadedInstrument { samples })
+    Ok(LoadedInstrument { groups })
 }
 
 /// Decode a single FLAC file described by its metadata entry.

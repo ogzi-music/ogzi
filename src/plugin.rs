@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nice_plug::prelude::*;
 use nice_plug_egui::{
@@ -25,6 +26,10 @@ pub enum Task {
 
 /// A (group, instrument) index pair.
 type Selection = (usize, usize);
+
+/// The last round-robin pick per (channel, note), as (group, member) indices into the
+/// currently loaded instrument.
+type RrLast = [[Option<(u32, u32)>; 128]; 16];
 
 /// The result a background task delivers back to the audio thread.
 type Delivery = (Selection, Arc<LoadedInstrument>);
@@ -57,6 +62,11 @@ pub struct Ogzi {
     voices: Vec<Voice>,
     /// Round-robin voice stealing.
     next_voice: usize,
+    /// The last round-robin pick per (channel, note), as (group, member) indices into the
+    /// currently loaded instrument.
+    rr_last: Box<RrLast>,
+    /// The state of the PRNG used for round-robin selection.
+    rng: u64,
 }
 
 impl Default for Ogzi {
@@ -84,11 +94,27 @@ impl Default for Ogzi {
             sample_rate: 1.0,
             voices: (0..NUM_VOICES).map(|_| Voice::inactive()).collect(),
             next_voice: 0,
+            rr_last: Box::new([[None; 128]; 16]),
+            // Any nonzero seed works for xorshift.
+            rng: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+                | 1,
         }
     }
 }
 
 impl Ogzi {
+    /// A random number below `bound`, from the plugin's xorshift PRNG.
+    fn random_below(&mut self, bound: usize) -> usize {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        (x % bound as u64) as usize
+    }
     /// The currently selected (group, instrument), clamped to the library's contents.
     fn selection(&self) -> Option<Selection> {
         let group_idx = self.params.group.value() as usize;
@@ -100,17 +126,26 @@ impl Ogzi {
 
     fn note_on(&mut self, note: u8, velocity: u8, channel: u8) {
         let velocity = velocity.max(1);
-        let Some(sample) = self
-            .loaded
-            .as_ref()
-            .and_then(|inst| inst.pick(note, velocity))
-            .cloned()
-        else {
-            if self.loaded.is_some() {
-                nice_log!("Ogzi: no sample for note {note} at velocity {velocity}");
-            }
+        let Some(instrument) = self.loaded.as_ref().cloned() else {
             return;
         };
+        let Some((group_idx, group)) = instrument.covering_group(note, velocity) else {
+            nice_log!("Ogzi: no sample for note {note} at velocity {velocity}");
+            return;
+        };
+
+        // Alternate between the group's samples (round-robin), picking at random but never
+        // repeating the previous pick so consecutive hits of the same note sound different.
+        let len = group.samples.len();
+        let mut member_idx = if len > 1 { self.random_below(len) } else { 0 };
+        if let Some((last_group, last_member)) = self.rr_last[channel as usize][note as usize]
+            && last_group == group_idx as u32
+            && last_member == member_idx as u32
+        {
+            member_idx = (member_idx + 1) % len;
+        }
+        self.rr_last[channel as usize][note as usize] = Some((group_idx as u32, member_idx as u32));
+        let sample = group.samples[member_idx].clone();
 
         // Retriggering the same note releases the old voice first so looped samples don't stack
         // up forever.
@@ -161,6 +196,10 @@ impl Ogzi {
             self.loaded_selection = selection;
             self.loading_selection = None;
             self.loading.store(false, Ordering::Relaxed);
+            // The round-robin picks refer to indices of the previous instrument.
+            for per_note in self.rr_last.iter_mut() {
+                per_note.fill(None);
+            }
         }
     }
 
@@ -221,9 +260,7 @@ impl Plugin for Ogzi {
             Task::LoadInstrument { group, instrument } => {
                 let loaded = load_instrument(&lib, group, instrument).unwrap_or_else(|e| {
                     nice_error!("Ogzi: failed to load instrument: {e}");
-                    LoadedInstrument {
-                        samples: Vec::new(),
-                    }
+                    LoadedInstrument { groups: Vec::new() }
                 });
                 *deliveries.lock().unwrap() = Some(((group, instrument), Arc::new(loaded)));
                 loading.store(false, Ordering::Relaxed);
@@ -358,12 +395,10 @@ mod tests {
             .expect("trumpet-jazz");
 
         let loaded = load_instrument(&lib, group, instrument).expect("instrument loads");
-        assert!(!loaded.samples.is_empty());
+        assert!(!loaded.groups.is_empty());
 
-        let sample_rate = loaded
-            .pick(60, 100)
-            .expect("sample for middle C")
-            .sample_rate;
+        let (_, group) = loaded.covering_group(60, 100).expect("sample for middle C");
+        let sample_rate = group.samples[0].sample_rate;
 
         // Render a short note through a real buffer and check that we actually get sound.
         let mut ogzi = Ogzi::default();
@@ -389,6 +424,46 @@ mod tests {
         assert!(
             real_buffers[0].iter().any(|s| s.abs() > 1e-6),
             "voice produced silence"
+        );
+    }
+
+    #[test]
+    fn round_robin_alternates() {
+        let lib = Library::load();
+        let group = lib
+            .groups
+            .iter()
+            .position(|g| g.slug == "pad")
+            .expect("pad group");
+        let instrument = lib.groups[group]
+            .instruments
+            .iter()
+            .position(|i| i.slug == "pad04")
+            .expect("pad04");
+
+        let loaded = load_instrument(&lib, group, instrument).expect("instrument loads");
+        let alt = loaded
+            .groups
+            .iter()
+            .find(|g| g.samples.len() > 1)
+            .expect("a round-robin group");
+        let note = alt.key_from;
+        let velocity = alt.vel_from.max(1);
+
+        // Hit the same note twice and check that the second hit plays a different sample.
+        // The first hit takes the first free voice slot; the retrigger releases that voice
+        // and starts the new one in the next slot.
+        let mut ogzi = Ogzi::default();
+        ogzi.sample_rate = alt.samples[0].sample_rate;
+        ogzi.loaded = Some(Arc::new(loaded));
+        ogzi.note_on(note, velocity, 0);
+        let first = ogzi.voices[0].sample.clone().unwrap();
+        ogzi.note_on(note, velocity, 0);
+        let second = ogzi.voices[1].sample.clone().unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "consecutive hits repeated the same sample"
         );
     }
 }

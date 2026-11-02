@@ -8,8 +8,9 @@ built with [nice-plug](https://codeberg.org/RustAudio/nice-plug) and an [egui](h
 
 It plays the library's FLAC samples in response to note events, picking the sample
 for the pressed key and velocity (including the library's key ranges, velocity
-layers, tuning, panning, loop points, and sample rates). The plugin has exactly
-two settings: the instrument group and the instrument.
+layers, automatic round-robin alternates, tuning, panning, loop points, and sample
+rates). The plugin has exactly two settings: the instrument group and the
+instrument.
 
 ## Building
 
